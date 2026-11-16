@@ -1,0 +1,81 @@
+name: Deploy AZ TechNova to Cloudflare Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aztechnova-pages-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check static site
+        run: |
+          test -s site/index.html
+          test -s site/social-preview.jpg
+          test -s site/robots.txt
+          test -s site/sitemap.xml
+          test -s site/googleb5ffc34f803b2157.html
+          grep -q 'name="google-site-verification"' site/index.html
+          grep -q 'rel="canonical" href="https://aztechnova.pages.dev/"' site/index.html
+
+      - name: Check existing Cloudflare Pages project
+        id: project
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          if [[ -z "$CLOUDFLARE_ACCOUNT_ID" || -z "$CLOUDFLARE_API_TOKEN" ]]; then
+            echo "::notice::Add the Cloudflare account ID and API token as GitHub Actions secrets to enable deployment."
+            exit 0
+          fi
+
+          project=$(curl --fail --silent --show-error \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/aztechnova")
+
+          if ! jq -e '.success and (.result.subdomain == "aztechnova.pages.dev") and (.result.source == null)' <<< "$project" > /dev/null; then
+            echo "::error::Expected the existing aztechnova.pages.dev Direct Upload project. Check its settings in Cloudflare."
+            exit 1
+          fi
+
+          branch=$(jq -er '.result.production_branch | select(type == "string" and length > 0)' <<< "$project")
+          if [[ ! "$branch" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/-]*$ ]]; then
+            echo "::error::Unexpected Cloudflare production branch name."
+            exit 1
+          fi
+          echo "production_branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy with Wrangler
+        if: steps.project.outputs.production_branch != ''
+        uses: cloudflare/wrangler-action@v4
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy site --project-name=aztechnova --branch=${{ steps.project.outputs.production_branch }}
+
+      - name: Verify production homepage
+        if: steps.project.outputs.production_branch != ''
+        run: |
+          for attempt in {1..12}; do
+            if curl --fail --silent --show-error \
+              "https://aztechnova.pages.dev/?deployment=$GITHUB_SHA" -o /tmp/aztechnova.html \
+              && cmp --silent site/index.html /tmp/aztechnova.html; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Production did not return the committed homepage."
+          exit 1
